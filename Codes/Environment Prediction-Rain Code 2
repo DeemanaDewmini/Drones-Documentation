@@ -1,0 +1,182 @@
+import random
+import numpy as np
+import pandas as pd
+from xgboost import XGBClassifier, XGBRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, mean_squared_error
+
+# ===========================
+# 1. Virtual Sensor Classes
+# ===========================
+
+class VirtualTempSensor:
+    def __init__(self):
+        self.min_temp = -10 
+        self.max_temp = 40
+        self.noise = 0.5
+    def read_temperature(self):
+        return round(random.uniform(self.min_temp, self.max_temp) + random.gauss(0, self.noise), 2)
+
+class VirtualHumiditySensor:
+    def __init__(self):
+        self.min_hum = 0
+        self.max_hum = 100
+        self.noise = 1.0
+    def read_humidity(self):
+        return round(random.uniform(self.min_hum, self.max_hum) + random.gauss(0, self.noise), 1)
+
+class VirtualPressureSensor:
+    def __init__(self):
+        self.min_p = 950
+        self.max_p = 1050
+        self.noise = 0.2
+    def read_pressure(self):
+        return round(random.uniform(self.min_p, self.max_p) + random.gauss(0, self.noise), 1)
+
+class VirtualMultispectralCamera:
+    def __init__(self, bands=6):
+        self.bands = bands
+    def capture_frame_mean(self):
+        return np.random.randint(0, 4096, size=self.bands)
+
+# ===========================
+# 2. Simulate virtual dataset
+# ===========================
+def simulate_dataset(samples=3000, sampling_interval_sec=2):
+    temp_sensor = VirtualTempSensor()
+    hum_sensor = VirtualHumiditySensor()
+    press_sensor = VirtualPressureSensor()
+    cam = VirtualMultispectralCamera()
+    
+    records = []
+    for _ in range(samples):
+        temperature = temp_sensor.read_temperature()
+        humidity = hum_sensor.read_humidity()
+        pressure = press_sensor.read_pressure()
+        
+        # Simple rain probability formula
+        rain_prob = 0.05 + 0.005*humidity - 0.003*(pressure-1010) - 0.002*(temperature-25)
+        rain_prob = max(0, min(1, rain_prob)) # clamp 0–1
+        label = 1 if random.random() < rain_prob else 0
+        
+        cam_means = cam.capture_frame_mean()
+        rec = {"temperature": temperature, "humidity": humidity, "pressure": pressure, "label": label}
+        for i, b in enumerate(cam_means):
+            rec[f"cam_b{i+1}"] = b
+        
+        records.append(rec)
+    
+    df = pd.DataFrame(records)
+    
+    # Compute "minutes until rain" for regression target
+    df['minutes_until_rain'] = np.nan
+    for i in range(len(df)):
+        future_rain = df['label'].iloc[i+1:] == 1
+        if future_rain.any():
+            minutes = (future_rain.idxmax() - i) * sampling_interval_sec / 60
+            df.at[i, 'minutes_until_rain'] = minutes
+    df.dropna(inplace=True) # drop the value if it is not available
+    return df
+
+# ===========================
+# 3. Train models
+# ===========================
+def train_models(df):
+    feature_cols = ["temperature", "humidity", "pressure", "cam_b1","cam_b2","cam_b3","cam_b4","cam_b5","cam_b6"]
+    
+    # Classification
+    X = df[feature_cols].values
+    y_class = df["label"].values
+    X_train, X_test, y_train, y_test = train_test_split(X, y_class, test_size=0.25, random_state=42)
+    
+    scaler_class = StandardScaler()
+    X_train_scaled = scaler_class.fit_transform(X_train)
+    X_test_scaled = scaler_class.transform(X_test)
+    
+    clf = XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.05,
+                        subsample=0.85, colsample_bytree=0.85, random_state=42, eval_metric="logloss")
+    clf.fit(X_train_scaled, y_train)
+    
+    # Regression
+    y_reg = df["minutes_until_rain"].values
+    X_train_r, X_test_r, y_train_r, y_test_r = train_test_split(X, y_reg, test_size=0.25, random_state=42)
+    
+    scaler_reg = StandardScaler()
+    X_train_r_scaled = scaler_reg.fit_transform(X_train_r)
+    X_test_r_scaled = scaler_reg.transform(X_test_r)
+    
+    reg = XGBRegressor(n_estimators=200, max_depth=5, learning_rate=0.05,
+                       subsample=0.85, colsample_bytree=0.85, random_state=42)
+    reg.fit(X_train_r_scaled, y_train_r)
+    
+    return clf, scaler_class, reg, scaler_reg, feature_cols
+
+# ===========================
+# 4. Prediction on one reading
+# ===========================
+def predict_rain(clf, scaler_class, reg, scaler_reg, feature_cols, latest_reading):
+    X = np.array([[latest_reading.get(c, 0) for c in feature_cols]])
+    X_scaled_clf = scaler_class.transform(X)
+    X_scaled_reg = scaler_reg.transform(X)
+    
+    prob = clf.predict_proba(X_scaled_clf)[:,1][0]
+    minutes_until_rain = reg.predict(X_scaled_reg)[0]
+    return prob, minutes_until_rain
+
+# ===========================
+# 5. Test on real dataset
+# ===========================
+def test_on_real_dataset(csv_path, clf, scaler_class, reg, scaler_reg, feature_cols):
+    df_real = pd.read_csv(csv_path, parse_dates=["Time"])
+
+    if "temperatu" in df_real.columns:
+        df_real.rename(columns={"temperatu": "temperature"}, inplace=True)
+
+    predictions = []
+    cam = VirtualMultispectralCamera()
+
+    for _, row in df_real.iterrows():
+        latest_reading = {
+            "temperature": row["temperature"],
+            "humidity": row["Humidity"],
+            "pressure": row["pressure"],
+        }
+
+        # Add fake camera bands
+        cam_means = cam.capture_frame_mean()
+        for i, b in enumerate(cam_means):
+            latest_reading[f"cam_b{i+1}"] = b
+
+        prob, minutes = predict_rain(clf, scaler_class, reg, scaler_reg, feature_cols, latest_reading)
+
+        predictions.append({
+            "Time": row["Time"],
+            "temperature": row["temperature"],
+            "humidity": row["Humidity"],
+            "pressure": row["pressure"],
+            "rain_probability": prob,
+            "estimated_minutes_until_rain": minutes
+        })
+
+    return pd.DataFrame(predictions)
+
+# ===========================
+# 6. MAIN
+# ===========================
+if __name__ == "__main__":
+    # Step 1: Simulate virtual dataset
+    df_virtual = simulate_dataset(samples=3000, sampling_interval_sec=2)
+
+    # Step 2: Train models
+    clf, scaler_class, reg, scaler_reg, feature_cols = train_models(df_virtual)
+
+    # Step 3: Test on real dataset (update the path)
+    real_csv_path = r'C:\Users\deema\Desktop\Work\Environment Prediction VS\Data Sets\archive\Weather_Dataset.csv'
+    df_results = test_on_real_dataset(real_csv_path, clf, scaler_class, reg, scaler_reg, feature_cols)
+
+    # Step 4: Print only once
+    print(df_results.head())
+    # Optional: save all results
+    df_results.to_csv(r"C:\Users\deema\Desktop\real_dataset_predictions.csv", index=False)
+
