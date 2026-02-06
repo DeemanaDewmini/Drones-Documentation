@@ -1,0 +1,259 @@
+import time
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from xgboost import XGBClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, mean_squared_error
+
+
+# ================================================================
+# 1. SENSOR CLASSES (weather + camera only)
+# ================================================================
+
+class VirtualTempSensor:
+    def __init__(self):
+        self.min_temp = -40
+        self.max_temp = 85
+        self.noise = 0.7
+
+    def read_temperature(self):
+        time.sleep(0.002)
+        base = random.uniform(self.min_temp, self.max_temp)
+        noisy = base + random.gauss(0, self.noise)
+        return round(noisy, 2)
+
+
+class VirtualHumiditySensor:
+    def __init__(self):
+        self.min_hum = 0
+        self.max_hum = 100
+        self.noise = 1.5
+
+    def read_humidity(self):
+        time.sleep(0.002)
+        base = random.uniform(self.min_hum, self.max_hum)
+        noisy = base + random.gauss(0, self.noise)
+        return round(noisy, 1)
+
+
+class VirtualPressureSensor:
+    def __init__(self):
+        self.min_p = 300
+        self.max_p = 1100
+        self.noise = 0.3
+
+    def read_pressure(self):
+        time.sleep(0.002)
+        base = random.uniform(self.min_p, self.max_p)
+        noisy = base + random.gauss(0, self.noise)
+        return round(noisy, 1)
+
+
+class VirtualMultispectralCamera:
+    def __init__(self, width=1280, height=960, bands=6):
+        self.width = width
+        self.height = height
+        self.bands = bands
+        self.adc_min = 0
+        self.adc_max = 4095
+
+    def capture_frame(self):
+        time.sleep(0.05)
+        return np.random.randint(
+            self.adc_min,
+            self.adc_max + 1,
+            size=(self.height, self.width, self.bands),
+            dtype=np.uint16
+        )
+
+
+# ================================================================
+# 2. DATASET SIMULATION (Option A)
+# ================================================================
+
+def simulate_dataset(samples=600):
+
+    temp_sensor = VirtualTempSensor()
+    hum_sensor = VirtualHumiditySensor()
+    press_sensor = VirtualPressureSensor()
+    cam = VirtualMultispectralCamera()
+
+    records = []
+
+    for _ in range(samples):
+
+        # --- Weather sensors ---
+        temperature = temp_sensor.read_temperature()
+        humidity = hum_sensor.read_humidity()
+        pressure = press_sensor.read_pressure()
+
+        # --- Ground truth rain probability ---
+        rain_prob = (
+            0.05
+            + 0.005 * humidity
+            - 0.003 * (pressure - 1010)
+            - 0.002 * (temperature - 25)
+        )
+        rain_prob = max(0, min(1, rain_prob))
+
+        # --- Ground truth label ---
+        rain_label = 1 if random.random() < rain_prob else 0
+
+        # --- Synthetic rain drop ADC (validation only) ---
+        if rain_label == 1:
+            drop_adc = random.randint(0, 499)
+        else:
+            drop_adc = random.randint(500, 1023)
+
+        # --- Camera frame ---
+        frame = cam.capture_frame()
+
+        if rain_label == 1:
+            frame = (frame * np.random.uniform(0.5, 0.8)).astype(np.uint16)
+
+        cam_means = frame.mean(axis=(0, 1))
+
+        # --- Record ---
+        rec = {
+            "temperature": temperature,
+            "humidity": humidity,
+            "pressure": pressure,
+            "drop_adc": drop_adc,   # validation only
+            "label": rain_label
+        }
+
+        for i, b in enumerate(cam_means):
+            rec[f"cam_b{i+1}"] = b
+
+        records.append(rec)
+
+    return pd.DataFrame(records)
+
+
+# ================================================================
+# 3. MODEL TRAINING (NO DATA LEAKAGE)
+# ================================================================
+
+def train_xgb_classifier(df):
+
+    feature_cols = [
+        "temperature", "humidity", "pressure",
+        "cam_b1", "cam_b2", "cam_b3",
+        "cam_b4", "cam_b5", "cam_b6"
+    ]
+
+    X = df[feature_cols].values
+    y = df["label"].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42
+    )
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    model = XGBClassifier(
+        n_estimators=250,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        random_state=42,
+        eval_metric="logloss"
+    )
+
+    model.fit(X_train_scaled, y_train)
+
+    y_pred = model.predict(X_test_scaled)
+    accuracy = accuracy_score(y_test, y_pred)
+
+    return model, scaler, accuracy, X_test_scaled, y_test
+
+
+# ================================================================
+# 4. KALMAN FILTER
+# ================================================================
+
+class KalmanFilter1D:
+    def __init__(self, process_var=0.002, measurement_var=0.05):
+        self.process_var = process_var
+        self.measurement_var = measurement_var
+        self.post_est = 0.5
+        self.post_var = 1.0
+
+    def update(self, measurement):
+        prior_est = self.post_est
+        prior_var = self.post_var + self.process_var
+
+        K = prior_var / (prior_var + self.measurement_var)
+
+        self.post_est = prior_est + K * (measurement - prior_est)
+        self.post_var = (1 - K) * prior_var
+
+        return self.post_est
+
+
+def kalman_smooth(preds):
+    kf = KalmanFilter1D()
+    return np.array([kf.update(x) for x in preds])
+
+
+# ================================================================
+# 5. PLOTTING
+# ================================================================
+
+def plot_results(prob, smooth, actual, rmse_model, rmse_smooth, zoom_window=100):
+
+    N = min(zoom_window, len(actual))
+
+    plt.figure(figsize=(15, 6))
+
+    plt.plot(prob[:N], "o-", label="XGB Probability", alpha=0.7)
+    plt.plot(smooth[:N], "s--", label="Kalman Smoothed", linewidth=2)
+    plt.step(range(N), actual[:N], where="mid",
+             label="Actual Rain", color="red", linewidth=2)
+
+    plt.xlabel("Sample")
+    plt.ylabel("Rain / Probability")
+    plt.title(
+        f"Rain Prediction vs Ground Truth\n"
+        f"RMSE Model: {rmse_model:.4f}, RMSE Smoothed: {rmse_smooth:.4f}"
+    )
+
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+# ================================================================
+# 6. MAIN
+# ================================================================
+
+if __name__ == "__main__":
+
+    print("Simulating dataset...")
+    df = simulate_dataset(600)
+
+    print("Training model...")
+    model, scaler, accuracy, X_test_scaled, y_test = train_xgb_classifier(df)
+
+    print(f"\nValidation Accuracy: {accuracy:.3f}")
+
+    prob = model.predict_proba(X_test_scaled)[:, 1]
+    rmse_model = np.sqrt(mean_squared_error(y_test, prob))
+
+    smooth = kalman_smooth(prob)
+    rmse_smooth = np.sqrt(mean_squared_error(y_test, smooth))
+
+    print(f"RMSE before Kalman: {rmse_model:.4f}")
+    print(f"RMSE after Kalman: {rmse_smooth:.4f}")
+
+    plot_results(prob, smooth, y_test, rmse_model, rmse_smooth)
+
+    print("\nDone.")
