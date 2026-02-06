@@ -1,0 +1,240 @@
+import numpy as np
+import pandas as pd
+import math
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import mean_squared_error
+from xgboost import XGBRegressor
+
+# ==========================
+# Virtual Sensors
+# ==========================
+class VirtualIMU:
+    def read(self, true_accel):
+        return true_accel + np.random.normal(0, 0.05, 3)
+
+class VirtualGPS:
+    def read(self, true_velocity):
+        return true_velocity + np.random.normal(0, 0.2, 3)
+
+class FlowSensor:
+    def read(self, true_airspeed):
+        return true_airspeed + np.random.normal(0, 0.1, 3)
+
+class UltrasonicAnemometer:
+    def read(self, true_wind):
+        speed = np.linalg.norm(true_wind) + np.random.normal(0, 0.05)
+        direction = math.atan2(true_wind[1], true_wind[0]) + np.random.normal(0, np.deg2rad(1))
+        vertical = true_wind[2] + np.random.normal(0, 0.02)
+        return np.array([
+            speed * math.cos(direction),
+            speed * math.sin(direction),
+            vertical
+        ])
+
+# ==========================
+# EKF for Wind Estimation
+# ==========================
+class WindEKF:
+    def __init__(self, dt):
+        self.dt = dt
+        self.x = np.zeros(6)   # [airspeed(3), wind(3)]
+        self.P = np.eye(6)
+        self.Q = np.diag([0.05]*3 + [0.01]*3)
+        self.R_gps = np.eye(3) * 0.05
+        self.R_flow = np.eye(3) * 0.01
+
+    def initialize(self, airspeed_init):
+        self.x[0:3] = airspeed_init
+
+    def predict(self, accel):
+        self.x[0:3] += accel * self.dt
+        self.P += self.Q
+
+    def update_gps(self, gps_vel):
+        H = np.zeros((3,6))
+        H[:,0:3] = np.eye(3)
+        H[:,3:6] = np.eye(3)
+        y = gps_vel - (self.x[0:3] + self.x[3:6])
+        S = H @ self.P @ H.T + self.R_gps
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x += K @ y
+        self.P = (np.eye(6) - K @ H) @ self.P
+
+    def update_flow(self, airspeed):
+        H = np.zeros((3,6))
+        H[:,0:3] = np.eye(3)
+        y = airspeed - self.x[0:3]
+        S = H @ self.P @ H.T + self.R_flow
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x += K @ y
+        self.P = (np.eye(6) - K @ H) @ self.P
+
+    def wind(self):
+        return self.x[3:6]
+
+# ==========================
+# Simulation Setup
+# ==========================
+np.random.seed(42)
+
+dt = 0.1
+steps = 600
+
+imu = VirtualIMU()
+gps = VirtualGPS()
+flow = FlowSensor()
+anemometer = UltrasonicAnemometer()
+
+ekf = WindEKF(dt)
+ekf.initialize(np.array([12.0, 0.0, 0.0]))
+
+true_airspeed = np.array([12.0, 0.0, 0.0])
+true_wind = np.array([3.25, 1.0, 0.5])
+
+dataset = []
+true_wind_hist = []
+
+# ==========================
+# Simulation Loop
+# ==========================
+for t in range(steps):
+    true_accel = np.array([
+        0.2 * np.sin(0.05 * t),
+        0.1 * np.cos(0.05 * t),
+        0.01 * np.sin(0.03 * t)
+    ])
+
+    accel = imu.read(true_accel)
+    wind_gt = anemometer.read(true_wind)
+    true_wind_hist.append(wind_gt)
+
+    gps_meas = gps.read(true_airspeed + wind_gt)
+    flow_meas = flow.read(true_airspeed)
+
+    ekf.predict(accel)
+    ekf.update_gps(gps_meas)
+    ekf.update_flow(flow_meas)
+
+    ekf_wind = ekf.wind()
+    residual = wind_gt - ekf_wind
+
+    dataset.append([
+        ekf_wind[0], ekf_wind[1], ekf_wind[2],
+        gps_meas[0], gps_meas[1], gps_meas[2],
+        accel[0], accel[1], accel[2],
+        flow_meas[0], flow_meas[1], flow_meas[2],
+        residual[0], residual[1], residual[2]
+    ])
+
+# ==========================
+# Dataset
+# ==========================
+df = pd.DataFrame(dataset, columns=[
+    "ekf_wx","ekf_wy","ekf_wz",
+    "gps_vx","gps_vy","gps_vz",
+    "imu_ax","imu_ay","imu_az",
+    "flow_vx","flow_vy","flow_vz",
+    "res_wx","res_wy","res_wz"
+])
+
+X = df.iloc[:, :12].values
+y = df.iloc[:, 12:].values
+
+# ==========================
+# TIME-SERIES SPLIT
+# ==========================
+split = int(0.75 * len(X))
+
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+
+# ==========================
+# Train ML (Residual Learner)
+# ==========================
+xgb = XGBRegressor(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    objective="reg:squarederror",
+    random_state=42
+)
+
+xgb.fit(X_train, y_train)
+
+# ==========================
+# Apply ML Correction
+# ==========================
+ekf_wind_arr = df[["ekf_wx","ekf_wy","ekf_wz"]].values
+true_wind_arr = np.array(true_wind_hist)
+
+residual_pred = xgb.predict(X_test)
+
+ekf_ml_wind_arr = ekf_wind_arr.copy()
+ekf_ml_wind_arr[split:] += residual_pred
+
+# ==========================
+# RMSE (TEST PERIOD ONLY)
+# ==========================
+ekf_err = true_wind_arr[split:] - ekf_wind_arr[split:]
+ml_err = true_wind_arr[split:] - ekf_ml_wind_arr[split:]
+
+ekf_rmse = np.sqrt(np.mean(ekf_err**2, axis=0))
+ml_rmse = np.sqrt(np.mean(ml_err**2, axis=0))
+
+print("\n===== TEST RMSE =====")
+print(f"EKF RMSE     : {ekf_rmse}")
+print(f"EKF + ML RMSE: {ml_rmse}")
+
+# ==========================
+# Plot Results
+# ==========================
+def wind_speed_dir(w):
+    speed = np.linalg.norm(w, axis=1)
+    direction = np.degrees(np.arctan2(w[:,1], w[:,0]))
+    return speed, direction
+
+speed_true, dir_true = wind_speed_dir(true_wind_arr)
+speed_ekf, dir_ekf = wind_speed_dir(ekf_wind_arr)
+speed_ml, dir_ml = wind_speed_dir(ekf_ml_wind_arr)
+
+split = int(0.75 * len(X))  # train/test split index
+test_indices = np.arange(split, len(X))
+
+# Wind Speed (Test Only)
+plt.figure(figsize=(10,4))
+plt.plot(test_indices, speed_true[split:], label="True")
+plt.plot(test_indices, speed_ekf[split:], linestyle="--", label="EKF")
+plt.plot(test_indices, speed_ml[split:], linestyle="-.", label="EKF + ML")
+plt.title("Wind Speed (Test Data Only)")
+plt.xlabel("Time Step")
+plt.ylabel("Wind Speed (m/s)")
+plt.legend()
+plt.grid()
+plt.show()
+
+# Wind Direction (Test Only)
+plt.figure(figsize=(10,4))
+plt.plot(test_indices, dir_true[split:], label="True")
+plt.plot(test_indices, dir_ekf[split:], linestyle="--", label="EKF")
+plt.plot(test_indices, dir_ml[split:], linestyle="-.", label="EKF + ML")
+plt.title("Wind Direction (Test Data Only)")
+plt.xlabel("Time Step")
+plt.ylabel("Wind Direction (deg)")
+plt.legend()
+plt.grid()
+plt.show()
+
+# Vertical Wind Component (Test Only)
+plt.figure(figsize=(10,4))
+plt.plot(test_indices, true_wind_arr[split:, 2], label="True Z")
+plt.plot(test_indices, ekf_wind_arr[split:, 2], linestyle="--", label="EKF Z")
+plt.plot(test_indices, ekf_ml_wind_arr[split:, 2], linestyle="-.", label="EKF + ML Z")
+plt.title("Vertical Wind Component (Test Data Only)")
+plt.xlabel("Time Step")
+plt.ylabel("Wind Z (m/s)")
+plt.legend()
+plt.grid()
+plt.show()
