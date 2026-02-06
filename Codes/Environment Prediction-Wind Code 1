@@ -1,0 +1,196 @@
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+
+# =========================
+# 1. Virtual IMU
+# =========================
+class VirtualIMU:
+    def __init__(self, accel_noise=0.05):
+        self.accel_noise = accel_noise
+
+    def read(self, true_accel):
+        noise = np.random.normal(0, self.accel_noise, 3)
+        return true_accel + noise
+
+# =========================
+# 2. Virtual GPS
+# =========================
+class VirtualGPS:
+    def __init__(self, vel_noise=0.2):
+        self.vel_noise = vel_noise
+
+    def read(self, true_velocity):
+        noise = np.random.normal(0, self.vel_noise, 3)
+        return true_velocity + noise
+
+# =========================
+# 3. Flow Sensor (airspeed)
+# =========================
+class FlowSensor:
+    def __init__(self, noise=0.1):
+        self.noise = noise
+
+    def read(self, true_airspeed):
+        noise = np.random.normal(0, self.noise, 3)
+        return true_airspeed + noise
+
+# =========================
+# 4. Ultrasonic Anemometer (ground truth)
+# =========================
+class UltrasonicAnemometer:
+    def __init__(self, speed_noise=0.05, dir_noise=1.0):
+        self.speed_noise = speed_noise
+        self.dir_noise = dir_noise
+
+    def read(self, true_wind_vec):
+        speed = np.linalg.norm(true_wind_vec[:2])
+        direction = math.degrees(math.atan2(true_wind_vec[1], true_wind_vec[0]))
+        speed_meas = speed + np.random.normal(0, self.speed_noise)
+        dir_meas = direction + np.random.normal(0, self.dir_noise)
+        wind_x = speed_meas * math.cos(math.radians(dir_meas))
+        wind_y = speed_meas * math.sin(math.radians(dir_meas))
+        return np.array([wind_x, wind_y, 0.0])
+
+# =========================
+# 5. EKF with Flow Sensor Fusion
+# =========================
+class WindEKF:
+    def __init__(self, dt):
+        self.dt = dt
+        self.x = np.zeros(6)  # [airspeed_x,airspeed_y,airspeed_z, wind_x, wind_y, wind_z]
+        self.P = np.eye(6) * 0.5
+        self.Q = np.diag([0.05]*3 + [0.01]*3)   # process noise
+        self.R_gps = np.eye(3) * 0.05           # GPS noise
+        self.R_flow = np.eye(3) * 0.01          # Flow sensor noise (trust flow sensor more)
+
+    def initialize(self, airspeed_init, wind_init):
+        self.x[0:3] = airspeed_init
+        self.x[3:6] = wind_init
+
+    def predict(self, accel):
+        self.x[0:3] += accel * self.dt
+        F = np.eye(6)
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update_gps(self, gps_velocity):
+        H = np.zeros((3,6))
+        H[:,0:3] = np.eye(3)
+        H[:,3:6] = np.eye(3)
+        z_pred = self.x[0:3] + self.x[3:6]
+        y = gps_velocity - z_pred
+        S = H @ self.P @ H.T + self.R_gps
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(6) - K @ H) @ self.P
+
+    def update_flow(self, airspeed_meas):
+        H = np.zeros((3,6))
+        H[:,0:3] = np.eye(3)
+        y = airspeed_meas - self.x[0:3]
+        S = H @ self.P @ H.T + self.R_flow
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(6) - K @ H) @ self.P
+
+    def airspeed(self):
+        return self.x[0:3]
+
+    def wind(self):
+        return self.x[3:6]
+
+# =========================
+# 6. Helper function
+# =========================
+def wind_speed_direction(wind_vec):
+    speed = np.linalg.norm(wind_vec[:2])
+    direction = math.degrees(math.atan2(wind_vec[1], wind_vec[0]))
+    return speed, direction
+
+# =========================
+# 7. Simulation
+# =========================
+if __name__ == "__main__":
+
+    dt = 0.1
+    steps = 200
+
+    # Sensors
+    imu = VirtualIMU()
+    gps = VirtualGPS()
+    flow = FlowSensor()
+    anemometer = UltrasonicAnemometer()
+
+    # EKF
+    ekf = WindEKF(dt)
+    ekf.initialize(airspeed_init=np.array([12.0,0.0,0.0]),
+                   wind_init=np.array([0.0,0.0,0.0]))
+
+    # True environment
+    true_airspeed = np.array([12.0,0.0,0.0])
+    env_wind = np.array([3.25, 0.0, 0.0])  # true wind along x
+
+    # Store results
+    wind_estimates = []
+    wind_truths = []
+
+    for t in range(steps):
+        # Ground truth wind sensor
+        true_wind_measured = anemometer.read(env_wind)
+
+        # Ground velocity
+        true_ground_velocity = true_airspeed + true_wind_measured
+
+        # Sensor measurements
+        accel_meas = imu.read(np.zeros(3))         # steady flight
+        gps_meas = gps.read(true_ground_velocity)
+        airspeed_meas = flow.read(true_airspeed)
+
+        # EKF predict
+        ekf.predict(accel_meas)
+
+        # EKF updates: GPS + Flow sensor
+        ekf.update_gps(gps_meas)
+        ekf.update_flow(airspeed_meas)
+
+        # Save results
+        wind_estimates.append(ekf.wind())
+        wind_truths.append(true_wind_measured)
+
+        # Print every 10 steps
+        if t % 10 == 0:
+            est_speed, est_dir = wind_speed_direction(ekf.wind())
+            gt_speed, gt_dir = wind_speed_direction(true_wind_measured)
+            print(f"t={t*dt:.1f}s | EKF: {est_speed:.2f} m/s, {est_dir:.1f}° | "
+                  f"Sensor GT: {gt_speed:.2f} m/s, {gt_dir:.1f}°")
+
+    # =========================
+    # 8. Plot Wind Speed and Direction
+    # =========================
+    wind_estimates = np.array(wind_estimates)
+    wind_truths = np.array(wind_truths)
+
+    # Wind speed
+    plt.figure(figsize=(10,5))
+    plt.plot(np.linalg.norm(wind_estimates[:,:2],axis=1), label='EKF Wind Speed')
+    plt.plot(np.linalg.norm(wind_truths[:,:2],axis=1), label='Sensor Ground Truth', linestyle='--')
+    plt.xlabel('Time step')
+    plt.ylabel('Wind Speed (m/s)')
+    plt.title('Wind Speed Estimation vs Ground Truth Sensor')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    # Wind direction
+    est_dir_deg = np.degrees(np.arctan2(wind_estimates[:,1], wind_estimates[:,0]))
+    gt_dir_deg = np.degrees(np.arctan2(wind_truths[:,1], wind_truths[:,0]))
+
+    plt.figure(figsize=(10,5))
+    plt.plot(est_dir_deg, label='EKF Wind Direction')
+    plt.plot(gt_dir_deg, label='Sensor Ground Truth', linestyle='--')
+    plt.xlabel('Time step')
+    plt.ylabel('Wind Direction (deg)')
+    plt.title('Wind Direction Estimation vs Ground Truth Sensor')
+    plt.legend()
+    plt.grid()
+    plt.show()
